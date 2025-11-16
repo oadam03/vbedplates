@@ -1,3 +1,7 @@
+i aint reading allat either don't worry.
+vbedplates, by me.
+/bedplate help for a list of commands, if you need to figure that out.
+keybinds soon, other features soon. primitive alpha for right now.
 -------------------------------------------
 Source installation information for modders
 -------------------------------------------
