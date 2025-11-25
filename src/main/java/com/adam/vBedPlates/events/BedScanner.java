@@ -13,6 +13,11 @@ import net.minecraft.util.ChatComponentText;
 import net.minecraft.world.World;
 
 import com.adam.vBedPlates.commands.BedplateCommand;
+import com.adam.vBedPlates.config.MapConfig;
+import com.adam.vBedPlates.config.MapConfigManager;
+import com.adam.vBedPlates.util.ScoreboardParser;
+import com.adam.vBedPlates.util.TeamDetector;
+import com.adam.vBedPlates.util.TeamDetector.BedTeam;
 
 import java.util.HashSet;
 import java.util.Set;
@@ -21,6 +26,9 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ArrayList;
 
+/**
+ * Enhanced bed scanner with map-aware scanning and team detection.
+ */
 public class BedScanner {
 	private final Set<BlockPos> knownBeds = new HashSet<>();
 	private final Set<Block> defenseBlocks = new HashSet<>();
@@ -29,11 +37,16 @@ public class BedScanner {
 	private final Map<BlockPos, Block> lastKnownBlocks = new HashMap<>();
 	public static List<BedData> trackedBeds = new ArrayList<>();
 
-	// Scan range constants
-	private static final int RADIUS_XZ = 30;
-	private static final int HEIGHT_UP = 15;
-	private static final int HEIGHT_DOWN = 5;
+	// Dynamic scan range based on map config
+	private int currentRadiusXZ = 30;
+	private int currentHeightUp = 15;
+	private int currentHeightDown = 5;
 	private static final int OBSIDIAN_SCAN_RADIUS = 5;
+
+	// Map tracking
+	private String currentMapName = null;
+	private MapConfig currentMapConfig = null;
+	private boolean hasWarnedNoConfig = false;
 
 	private int tickCounter = 0;
 
@@ -46,46 +59,136 @@ public class BedScanner {
 		World world = mc.theWorld;
 		BlockPos playerPos = mc.thePlayer.getPosition();
 
-		// Every second, rescan for new or destroyed beds
+		// Check for map changes every 2 seconds
+		if (world.getTotalWorldTime() % 40 == 0) {
+			updateMapConfiguration();
+		}
+
+		// Perform bed scanning every second (using dynamic scan range)
 		if (world.getTotalWorldTime() % 20 == 0) {
 			scanForBeds(world, playerPos);
 			updateDefenseBlocks(world);
-			rebuildObsidianHighlights(world); // Rebuild obsidian list from scratch
+			rebuildObsidianHighlights(world);
 		}
 
-		// Every 0.5 seconds, detect nearby obsidian changes
+		// Detect nearby block changes every 0.5 seconds
 		if (tickCounter++ >= 10) {
 			detectNearbyBlockChanges(world);
 			tickCounter = 0;
 		}
 	}
 
-	// On world load check for beds.
 	@SubscribeEvent
 	public void onWorldLoad(WorldEvent.Load event) {
 		Minecraft mc = Minecraft.getMinecraft();
 		if (mc.theWorld == null || mc.thePlayer == null) return;
 
+		// Clear map cache on world change
+		currentMapName = null;
+		currentMapConfig = null;
+		hasWarnedNoConfig = false;
+		ScoreboardParser.clearCache();
+
 		World world = mc.theWorld;
 		BlockPos playerPos = mc.thePlayer.getPosition();
 
-		sendChat("§7World loaded — performing initial bed scan...");
+		sendChat("§7World loaded — checking for Bedwars game...");
+
+		// Initialize map config manager if not already done
+		if (!MapConfigManager.getInstance().isLoaded()) {
+			MapConfigManager.getInstance().initialize();
+		}
+
+		updateMapConfiguration();
 		scanForBeds(world, playerPos);
 		updateDefenseBlocks(world);
+	}
+
+	/**
+	 * Updates map configuration based on scoreboard data.
+	 * Adjusts scan parameters accordingly.
+	 */
+	private void updateMapConfiguration() {
+		if (!ScoreboardParser.isInBedwarsGame()) {
+			// Not in Bedwars, use default scanning
+			if (currentMapName != null) {
+				sendChat("§7Left Bedwars game — reverting to default scanning");
+				currentMapName = null;
+				currentMapConfig = null;
+				resetToDefaultScanParameters();
+			}
+			return;
+		}
+
+		String mapName = ScoreboardParser.getCurrentMapName();
+
+		// Map hasn't changed
+		if (mapName == null || mapName.equals(currentMapName)) {
+			return;
+		}
+
+		currentMapName = mapName;
+		currentMapConfig = MapConfigManager.getInstance().getMapConfig(mapName);
+
+		if (currentMapConfig != null) {
+			// Update scan parameters based on map config
+			MapConfig.ScanParameters params = currentMapConfig.getScanParameters();
+			currentRadiusXZ = params.radiusXZ;
+			currentHeightUp = params.heightUp;
+			currentHeightDown = params.heightDown;
+
+			sendChat("§aMap detected: §f" + currentMapConfig.name +
+					" §7(" + currentMapConfig.getTeamCount() + " teams, " +
+					(currentMapConfig.isFastMode() ? "Fast" : "Slow") + ")");
+			sendChat("§7Scan area: §f" + currentRadiusXZ + "x" + currentHeightUp + "x" + currentHeightDown);
+
+			hasWarnedNoConfig = false;
+
+			// Clear and rescan with new parameters
+			clearAllTracking();
+			scanForBeds(Minecraft.getMinecraft().theWorld,
+					Minecraft.getMinecraft().thePlayer.getPosition());
+		} else {
+			// Unknown map - use default scanning
+			if (!hasWarnedNoConfig) {
+				sendChat("§eMap '§f" + mapName + "§e' not found in database");
+				sendChat("§7Using default scan parameters");
+				hasWarnedNoConfig = true;
+			}
+			resetToDefaultScanParameters();
+		}
+	}
+
+	/**
+	 * Resets scan parameters to defaults (for unknown maps or non-Bedwars)
+	 */
+	private void resetToDefaultScanParameters() {
+		currentRadiusXZ = 30;
+		currentHeightUp = 15;
+		currentHeightDown = 5;
+	}
+
+	/**
+	 * Clears all tracking data
+	 */
+	private void clearAllTracking() {
+		knownBeds.clear();
+		trackedBeds.clear();
+		defenseBlocks.clear();
+		obsidianBlocks.clear();
+		fullyEncasedBeds.clear();
+		lastKnownBlocks.clear();
 	}
 
 	private void detectNearbyBlockChanges(World world) {
 		Set<BlockPos> affectedBeds = new HashSet<>();
 		Set<BlockPos> newObsidian = new HashSet<>();
 
-		// Only check beds that still exist
 		for (BlockPos bed : new HashSet<>(knownBeds)) {
-			// Skip if bed was destroyed
 			if (world.getBlockState(bed).getBlock() != Blocks.bed) {
 				continue;
 			}
 
-			// Only check the 2-block radius cube around the bed
 			BlockPos min = bed.add(-2, 0, -2);
 			BlockPos max = bed.add(2, 4, 2);
 
@@ -93,15 +196,12 @@ public class BedScanner {
 				Block current = world.getBlockState(pos).getBlock();
 				Block previous = lastKnownBlocks.get(pos);
 
-				// Always refresh last known
 				lastKnownBlocks.put(pos, current);
 
-				// Keep obsidian for rendering
 				if (current == Blocks.obsidian) {
 					newObsidian.add(pos);
 				}
 
-				// Detect obsidian placement/removal changes
 				if (previous == null || previous != current) {
 					if (current == Blocks.obsidian || previous == Blocks.obsidian) {
 						affectedBeds.add(bed);
@@ -110,18 +210,16 @@ public class BedScanner {
 			}
 		}
 
-		// Update visible obsidian highlights
 		obsidianBlocks.clear();
 		obsidianBlocks.addAll(newObsidian);
 
-		// Recheck only affected beds for encasement
 		for (BlockPos bed : affectedBeds) {
 			checkFullBedEncasement(world, bed);
 		}
 	}
 
 	private void scanForBeds(World world, BlockPos center) {
-		// Check known beds are still valid
+		// Validate destroyed beds
 		List<BedData> toRemoveData = new ArrayList<>();
 		Set<BlockPos> toRemoveBeds = new HashSet<>();
 
@@ -131,44 +229,47 @@ public class BedScanner {
 				toRemoveData.add(bedData);
 				toRemoveBeds.add(bedData.pos);
 
-				// Clear ESP outlines for obsidian near this destroyed bed
 				BlockPos min = bedData.pos.add(-OBSIDIAN_SCAN_RADIUS, 0, -OBSIDIAN_SCAN_RADIUS);
 				BlockPos max = bedData.pos.add(OBSIDIAN_SCAN_RADIUS, OBSIDIAN_SCAN_RADIUS, OBSIDIAN_SCAN_RADIUS);
 				for (BlockPos pos : BlockPos.getAllInBox(min, max)) {
-					obsidianBlocks.remove(pos);  // Remove from visual tracking
-					lastKnownBlocks.remove(pos); // Clear cache
+					obsidianBlocks.remove(pos);
+					lastKnownBlocks.remove(pos);
 				}
-
-				//sendChat("§7Bed at §f" + bedData.pos + " §7was destroyed.");
 			}
 		}
 
-		// Remove invalid beds from all tracking structures
 		trackedBeds.removeAll(toRemoveData);
 		knownBeds.removeAll(toRemoveBeds);
 		defenseBlocks.clear();
 		fullyEncasedBeds.removeAll(toRemoveBeds);
 
-		// Scan for new beds
-		for (int x = -RADIUS_XZ; x <= RADIUS_XZ; x++) {
-			for (int y = -HEIGHT_DOWN; y <= HEIGHT_UP; y++) {
-				for (int z = -RADIUS_XZ; z <= RADIUS_XZ; z++) {
+		// Scan for new beds using dynamic scan range
+		for (int x = -currentRadiusXZ; x <= currentRadiusXZ; x++) {
+			for (int y = -currentHeightDown; y <= currentHeightUp; y++) {
+				for (int z = -currentRadiusXZ; z <= currentRadiusXZ; z++) {
 					BlockPos checkPos = center.add(x, y, z);
 					Block block = world.getBlockState(checkPos).getBlock();
 
 					if (block == Blocks.bed) {
 						int meta = block.getMetaFromState(world.getBlockState(checkPos));
 						boolean isHead = (meta & 8) != 0;
+
 						if (!isHead && !knownBeds.contains(checkPos)) {
 							knownBeds.add(checkPos);
-							//sendChat("§cFound bed (foot) at §f" + checkPos.getX() + " " + checkPos.getY() + " " + checkPos.getZ());
 							BlockPos headPos = getOtherHalf(world, checkPos);
 							if (headPos != null) {
 								knownBeds.add(headPos);
 							}
-							// Track bed for rendering overlays
-							BedData bedData = new BedData(checkPos);
+
+							// Detect team and create bed data
+							BedTeam team = TeamDetector.detectBedTeam(world, checkPos);
+							BedData bedData = new BedData(checkPos, team);
 							trackedBeds.add(bedData);
+
+							String teamInfo = (team != BedTeam.UNKNOWN)
+									? " " + TeamDetector.getTeamIcon(team)
+									: "";
+							//sendChat("§aFound bed" + teamInfo + " §7at §f" + checkPos.getX() + " " + checkPos.getY() + " " + checkPos.getZ());
 
 							// Cache nearby blocks
 							BlockPos min = checkPos.add(-4, 0, -4);
@@ -218,7 +319,6 @@ public class BedScanner {
 	}
 
 	private void scanSurroundings(World world, BlockPos bedPos, int radius) {
-		//sendChat("Scanning defense for bed @ " + bedPos);
 		for (int x = -radius; x <= radius; x++) {
 			for (int y = 0; y <= radius; y++) {
 				for (int z = -radius; z <= radius; z++) {
@@ -228,7 +328,6 @@ public class BedScanner {
 					if (nearbyBlock == Blocks.obsidian) {
 						if (!obsidianBlocks.contains(checkPos)) {
 							obsidianBlocks.add(checkPos);
-							// sendChat("§5Detected obsidian §7at §f" + checkPos.getX() + " " + checkPos.getY() + " " + checkPos.getZ());
 						}
 					}
 				}
@@ -236,7 +335,6 @@ public class BedScanner {
 		}
 	}
 
-	// Rebuild the entire obsidian highlight list from all active beds
 	private void rebuildObsidianHighlights(World world) {
 		obsidianBlocks.clear();
 
@@ -359,12 +457,21 @@ public class BedScanner {
 		return this.obsidianBlocks;
 	}
 
+	/**
+	 * Enhanced BedData with team information
+	 */
 	public static class BedData {
 		public BlockPos pos;
 		public Set<Block> defenseBlocks = new HashSet<>();
+		public BedTeam team;
 
 		public BedData(BlockPos pos) {
+			this(pos, BedTeam.UNKNOWN);
+		}
+
+		public BedData(BlockPos pos, BedTeam team) {
 			this.pos = pos;
+			this.team = team;
 		}
 
 		public ItemStack[] getDefenseItems() {
